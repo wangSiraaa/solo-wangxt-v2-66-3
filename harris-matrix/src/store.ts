@@ -1,17 +1,32 @@
 import { computed, reactive } from 'vue'
 import { db } from './db'
 import { cyclePathIfAdded, layeredPositions, reachablePairs, redundantEdges, type OrderEdge } from './graph'
+import {
+  affectedUnits,
+  canonicalDiagnostics,
+  canonicalResults,
+  computeDiagnostics,
+  computeUnitIntervals,
+  type PhasingInput,
+  type RecomputeCause,
+} from './phasing'
 import { buildSample } from './sample'
 import type {
   Batch,
+  ComputationVersion,
   Evidence,
   Mutation,
+  Phase,
+  PhaseAssignment,
+  PhaseConstraint,
+  PhaseDiagnostic,
   ProjectExport,
   Relation,
   RelationDraft,
   Retraction,
   StratUnit,
   TableName,
+  UnitInterval,
   UnitPosition,
   UnitType,
 } from './types'
@@ -24,6 +39,13 @@ export const state = reactive({
   evidences: [] as Evidence[],
   retractions: [] as Retraction[],
   batches: [] as Batch[],
+  phases: [] as Phase[],
+  phaseConstraints: [] as PhaseConstraint[],
+  /** 以 unitId 为键：一个层位至多分配到一个阶段 */
+  assignments: {} as Record<string, PhaseAssignment>,
+  versions: [] as ComputationVersion[],
+  /** 当前（最新版本）的矛盾诊断 */
+  diagnostics: [] as PhaseDiagnostic[],
   viewMode: 'raw' as 'raw' | 'simplified',
   selectedUnitId: null as string | null,
   /** 待确认的成环关系：记录员可选择保留为矛盾记录或取消 */
@@ -56,13 +78,36 @@ export function unitLabel(id: string): string {
   return state.units.find((u) => u.id === id)?.label ?? id
 }
 
+export function phaseLabel(id: string): string {
+  return state.phases.find((p) => p.id === id)?.label ?? id
+}
+
 export function evidenceRef(id: string): string {
   return state.evidences.find((e) => e.id === id)?.ref ?? id
 }
 
+/* ---------- 阶段推演派生数据 ---------- */
+
+export const latestVersion = computed(() =>
+  state.versions.length > 0 ? state.versions[state.versions.length - 1] : null,
+)
+
+/** 层位 id → 最新区间结果 */
+export const intervalByUnit = computed(() => {
+  const map = new Map<string, UnitInterval>()
+  for (const r of latestVersion.value?.results ?? []) map.set(r.unitId, r)
+  return map
+})
+
+/** 涉及某阶段的未解决诊断（用于阻止标记有效） */
+export function diagnosticsForPhase(phaseId: string): PhaseDiagnostic[] {
+  return state.diagnostics.filter((d) => d.phaseIds.includes(phaseId))
+}
+
 /* ---------- 基础工具 ---------- */
 
-const uid = () => crypto.randomUUID()
+const uid = () =>
+  globalThis.crypto?.randomUUID?.() ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
 
 let toastTimer = 0
 export function toast(msg: string) {
@@ -72,7 +117,16 @@ export function toast(msg: string) {
 }
 
 function tableOf(name: TableName) {
-  return { units: db.units, positions: db.positions, relations: db.relations, evidences: db.evidences, retractions: db.retractions }[name]
+  return {
+    units: db.units,
+    positions: db.positions,
+    relations: db.relations,
+    evidences: db.evidences,
+    retractions: db.retractions,
+    phases: db.phases,
+    phaseConstraints: db.phaseConstraints,
+    assignments: db.assignments,
+  }[name]
 }
 
 /** 写入 IndexedDB 前去除 Vue 响应式代理（structuredClone 无法克隆 Proxy） */
@@ -93,20 +147,31 @@ async function applyInverse(m: Mutation) {
 }
 
 export async function refresh() {
-  const [units, positions, relations, evidences, retractions, batches] = await Promise.all([
-    db.units.toArray(),
-    db.positions.toArray(),
-    db.relations.toArray(),
-    db.evidences.toArray(),
-    db.retractions.toArray(),
-    db.batches.orderBy('at').toArray(),
-  ])
+  const [units, positions, relations, evidences, retractions, batches, phases, phaseConstraints, assignments, versions, diagnostics] =
+    await Promise.all([
+      db.units.toArray(),
+      db.positions.toArray(),
+      db.relations.toArray(),
+      db.evidences.toArray(),
+      db.retractions.toArray(),
+      db.batches.orderBy('at').toArray(),
+      db.phases.toArray(),
+      db.phaseConstraints.toArray(),
+      db.assignments.toArray(),
+      db.versions.orderBy('at').toArray(),
+      db.diagnostics.toArray(),
+    ])
   state.units = units.sort((a, b) => a.label.localeCompare(b.label, 'zh-CN'))
   state.positions = Object.fromEntries(positions.map((p) => [p.unitId, p]))
   state.relations = relations.sort((a, b) => a.createdAt - b.createdAt)
   state.evidences = evidences.sort((a, b) => a.createdAt - b.createdAt)
   state.retractions = retractions.sort((a, b) => a.at - b.at)
   state.batches = batches
+  state.phases = phases.sort((a, b) => a.createdAt - b.createdAt)
+  state.phaseConstraints = phaseConstraints.sort((a, b) => a.createdAt - b.createdAt)
+  state.assignments = Object.fromEntries(assignments.map((a) => [a.unitId, a]))
+  state.versions = versions
+  state.diagnostics = diagnostics
   state.loaded = true
 }
 
@@ -129,7 +194,216 @@ export async function undo() {
   for (const m of [...batch.mutations].reverse()) await applyInverse(m)
   await db.batches.update(batch.id, { undone: true })
   await refresh()
+  await maybeRecompute({ type: 'all' }, `撤销：${batch.label}`)
   toast(`已撤销：${batch.label}`)
+}
+
+/* ---------- 阶段推演：增量重算 ---------- */
+
+function phasingInput(): PhasingInput {
+  return {
+    unitIds: state.units.map((u) => u.id),
+    edges: orderEdges.value,
+    phases: state.phases,
+    constraints: state.phaseConstraints,
+    assignments: Object.values(state.assignments),
+  }
+}
+
+/**
+ * 重算阶段区间与诊断，并持久化为一个新的计算版本。
+ * 依据变更原因只重算受影响的层位，其余层位沿用上一版本结果；
+ * 诊断涉及全局证据链，每次全量重算（代价极低）。
+ */
+export async function recomputePhases(cause: RecomputeCause, label: string) {
+  const input = phasingInput()
+  const prev = state.versions.length > 0 ? state.versions[state.versions.length - 1] : null
+  const prevResults = new Map((prev?.results ?? []).map((r) => [r.unitId, r]))
+
+  let affected: Set<string> | null = null
+  if (prev) {
+    affected = affectedUnits(cause, {
+      unitIds: input.unitIds,
+      prevEdges: prev.edgesSnapshot,
+      nextEdges: input.edges,
+      prevConstraints: prev.constraintsSnapshot,
+      nextConstraints: input.constraints,
+      prevResults,
+    })
+  }
+  const targets = affected ? input.unitIds.filter((id) => affected.has(id)) : input.unitIds
+
+  let results: UnitInterval[] = []
+  if (input.phases.length > 0) {
+    const fresh = computeUnitIntervals(targets, input)
+    for (const id of input.unitIds) {
+      const hit = fresh.get(id) ?? prevResults.get(id) ?? computeUnitIntervals([id], input).get(id)
+      if (hit) results.push(hit)
+    }
+  }
+
+  const diagnostics = computeDiagnostics(
+    { ...input, relations: state.relations },
+    { unit: unitLabel, phase: phaseLabel },
+  )
+  for (const d of diagnostics) d.id = uid()
+
+  const version: ComputationVersion = {
+    id: uid(),
+    // 严格递增，保证刷新后按 at 排序仍能还原版本先后
+    at: Math.max(Date.now(), (prev?.at ?? 0) + 1),
+    cause: label,
+    affectedUnitIds: targets,
+    results,
+    diagnostics,
+    edgesSnapshot: input.edges,
+    constraintsSnapshot: input.constraints.map((c) => ({ from: c.from, to: c.to })),
+  }
+  await db.versions.put(plain(version))
+  await db.transaction('rw', [db.diagnostics], async () => {
+    await db.diagnostics.clear()
+    if (diagnostics.length > 0) await db.diagnostics.bulkPut(plain(diagnostics))
+  })
+  state.versions = [...state.versions, version]
+  state.diagnostics = diagnostics
+
+  // 矛盾波及的阶段：自动撤销其“有效”标记（有效标记是直接写入，不进入撤销批次）
+  const involved = new Set(diagnostics.flatMap((d) => d.phaseIds))
+  const revoked = state.phases.filter((p) => p.valid && involved.has(p.id))
+  for (const p of revoked) await db.phases.update(p.id, { valid: false, validAt: null })
+  if (revoked.length > 0) {
+    const ids = new Set(revoked.map((p) => p.id))
+    state.phases = state.phases.map((p) => (ids.has(p.id) ? { ...p, valid: false, validAt: null } : p))
+    toast(`阶段 ${revoked.map((p) => p.label).join('、')} 出现矛盾，已撤销其有效标记`)
+  }
+}
+
+/** 尚未建立阶段框架且从未计算过时跳过，避免产生空白版本 */
+async function maybeRecompute(cause: RecomputeCause, label: string) {
+  if (state.phases.length === 0 && state.versions.length === 0) return
+  await recomputePhases(cause, label)
+}
+
+/* ---------- 阶段 ---------- */
+
+export async function addPhase(label: string, note: string) {
+  label = label.trim()
+  if (!label) return
+  if (state.phases.some((p) => p.label === label)) {
+    toast(`阶段 ${label} 已存在`)
+    return
+  }
+  const phase: Phase = { id: uid(), label, note: note.trim(), createdAt: Date.now(), valid: false, validAt: null }
+  await runBatch(`新增阶段 ${label}`, [{ table: 'phases', key: phase.id, before: null, after: phase }])
+  // 新阶段对所有层位都可行，区间整体放宽
+  await recomputePhases({ type: 'all' }, `新增阶段 ${label}`)
+  toast(`已新增阶段 ${label}`)
+}
+
+export async function deletePhase(id: string) {
+  const phase = state.phases.find((p) => p.id === id)
+  if (!phase) return
+  const mutations: Mutation[] = [{ table: 'phases', key: id, before: phase, after: null }]
+  // 连带删除涉及该阶段的约束与分配（全部记入批次，可整体撤销）
+  for (const c of state.phaseConstraints.filter((c) => c.from === id || c.to === id)) {
+    mutations.push({ table: 'phaseConstraints', key: c.id, before: c, after: null })
+  }
+  for (const a of Object.values(state.assignments).filter((a) => a.phaseId === id)) {
+    mutations.push({ table: 'assignments', key: a.unitId, before: a, after: null })
+  }
+  await runBatch(`删除阶段 ${phase.label}（连带 ${mutations.length - 1} 条约束/分配）`, mutations)
+  await recomputePhases({ type: 'all' }, `删除阶段 ${phase.label}`)
+  toast(`已删除阶段 ${phase.label}`)
+}
+
+/** 新增阶段前后约束；阶段偏序必须保持无环，成环直接拒绝 */
+export async function addPhaseConstraint(from: string, to: string, note: string) {
+  if (!from || !to) return
+  if (from === to) {
+    toast('阶段不能早于其自身')
+    return
+  }
+  const dup = state.phaseConstraints.some((c) => c.from === from && c.to === to)
+  if (dup) {
+    toast('相同的阶段约束已存在')
+    return
+  }
+  const edges = state.phaseConstraints.map((c) => ({ id: c.id, from: c.from, to: c.to }))
+  const cycle = cyclePathIfAdded(edges, from, to)
+  if (cycle) {
+    toast(`该约束会使阶段顺序成环：${cycle.map(phaseLabel).join(' → ')}`)
+    return
+  }
+  const constraint: PhaseConstraint = { id: uid(), from, to, note: note.trim(), createdAt: Date.now() }
+  await runBatch(`新增阶段约束：${phaseLabel(from)} 早于 ${phaseLabel(to)}`, [
+    { table: 'phaseConstraints', key: constraint.id, before: null, after: constraint },
+  ])
+  await recomputePhases({ type: 'constraint', from, to }, `新增阶段约束 ${phaseLabel(from)}→${phaseLabel(to)}`)
+  toast('已添加阶段约束')
+}
+
+export async function removePhaseConstraint(id: string) {
+  const constraint = state.phaseConstraints.find((c) => c.id === id)
+  if (!constraint) return
+  await runBatch(`删除阶段约束：${phaseLabel(constraint.from)} 早于 ${phaseLabel(constraint.to)}`, [
+    { table: 'phaseConstraints', key: id, before: constraint, after: null },
+  ])
+  await recomputePhases(
+    { type: 'constraint', from: constraint.from, to: constraint.to },
+    `删除阶段约束 ${phaseLabel(constraint.from)}→${phaseLabel(constraint.to)}`,
+  )
+  toast('已删除阶段约束，相关区间已放宽重算')
+}
+
+/* ---------- 层位 → 阶段分配 ---------- */
+
+export async function assignUnitPhase(unitId: string, phaseId: string) {
+  const unit = state.units.find((u) => u.id === unitId)
+  const phase = state.phases.find((p) => p.id === phaseId)
+  if (!unit || !phase) return
+  const existing = state.assignments[unitId]
+  const assignment: PhaseAssignment = { unitId, phaseId, at: Date.now() }
+  await runBatch(
+    existing ? `改派层位 ${unit.label}：${phaseLabel(existing.phaseId)} → ${phase.label}` : `分配层位 ${unit.label} 至 ${phase.label}`,
+    [{ table: 'assignments', key: unitId, before: existing ?? null, after: assignment }],
+  )
+  await recomputePhases({ type: 'assignment', unitId }, `分配 ${unit.label} 至 ${phase.label}`)
+  toast(`已分配 ${unit.label} 至阶段 ${phase.label}`)
+}
+
+export async function unassignUnit(unitId: string) {
+  const existing = state.assignments[unitId]
+  if (!existing) return
+  await runBatch(`移除层位 ${unitLabel(unitId)} 的阶段分配`, [
+    { table: 'assignments', key: unitId, before: existing, after: null },
+  ])
+  await recomputePhases({ type: 'assignment', unitId }, `移除 ${unitLabel(unitId)} 的阶段分配`)
+  toast('已移除分配')
+}
+
+/* ---------- 阶段有效标记（直接写入，不进入撤销批次） ---------- */
+
+/** 标记阶段为有效：存在涉及该阶段的未解决诊断时拒绝 */
+export async function markPhaseValid(id: string): Promise<boolean> {
+  const phase = state.phases.find((p) => p.id === id)
+  if (!phase) return false
+  const blocking = diagnosticsForPhase(id)
+  if (blocking.length > 0) {
+    toast(`无法标记有效：${blocking.length} 条矛盾诊断涉及阶段 ${phase.label}，请先处理`)
+    return false
+  }
+  await db.phases.update(id, { valid: true, validAt: Date.now() })
+  state.phases = state.phases.map((p) => (p.id === id ? { ...p, valid: true, validAt: Date.now() } : p))
+  toast(`阶段 ${phase.label} 已标记为有效`)
+  return true
+}
+
+export async function unmarkPhaseValid(id: string) {
+  const phase = state.phases.find((p) => p.id === id)
+  if (!phase) return
+  await db.phases.update(id, { valid: false, validAt: null })
+  state.phases = state.phases.map((p) => (p.id === id ? { ...p, valid: false, validAt: null } : p))
+  toast(`已取消阶段 ${phase.label} 的有效标记`)
 }
 
 /* ---------- 层位 ---------- */
@@ -143,6 +417,7 @@ export async function addUnit(label: string, type: UnitType, note: string) {
   }
   const unit: StratUnit = { id: uid(), label, type, note: note.trim(), createdAt: Date.now() }
   await runBatch(`新增层位 ${label}`, [{ table: 'units', key: unit.id, before: null, after: unit }])
+  await maybeRecompute({ type: 'unit-added', unitId: unit.id }, `新增层位 ${label}`)
   toast(`已新增层位 ${label}`)
 }
 
@@ -159,8 +434,13 @@ export async function deleteUnit(id: string) {
       mutations.push({ table: 'retractions', key: x.id, before: x, after: null })
     }
   }
+  // 连带删除该层位的阶段分配
+  const assignment = state.assignments[id]
+  if (assignment) mutations.push({ table: 'assignments', key: id, before: assignment, after: null })
   await runBatch(`删除层位 ${unit.label}（连带 ${mutations.length - (pos ? 2 : 1)} 条关系）`, mutations)
   if (state.selectedUnitId === id) state.selectedUnitId = null
+  // 层位消失对偏序的影响范围难以局部界定，保守全量重算
+  await maybeRecompute({ type: 'all' }, `删除层位 ${unit.label}`)
   toast(`已删除层位 ${unit.label}`)
 }
 
@@ -221,6 +501,7 @@ export async function addRelation(draft: RelationDraft, allowConflict = false) {
     await runBatch(`新增同期关联：${describe(draft)}`, [
       { table: 'relations', key: relation.id, before: null, after: relation },
     ])
+    await maybeRecompute({ type: 'relation', from: draft.from, to: draft.to }, `新增同期关联 ${describe(draft)}`)
     toast('已保存同期关联（不进入有向图）')
     return
   }
@@ -235,6 +516,7 @@ export async function addRelation(draft: RelationDraft, allowConflict = false) {
     cycle ? `新增矛盾记录：${describe(draft)}` : `新增先后关系：${describe(draft)}`,
     [{ table: 'relations', key: relation.id, before: null, after: relation }],
   )
+  await maybeRecompute({ type: 'relation', from: draft.from, to: draft.to }, `新增先后关系 ${describe(draft)}`)
   toast(cycle ? '已保存为矛盾记录（成环路径见画布红边）' : '已添加先后关系')
 }
 
@@ -265,6 +547,7 @@ export async function retractRelation(id: string, reason: string) {
     { table: 'relations', key: id, before: rel, after: { ...rel, status: 'retracted' as const } },
     { table: 'retractions', key: retraction.id, before: null, after: retraction },
   ])
+  await maybeRecompute({ type: 'relation', from: rel.from, to: rel.to }, `撤回判断 ${unitLabel(rel.from)}→${unitLabel(rel.to)}`)
   toast('已撤回，判断与理由已单独存档')
 }
 
@@ -313,20 +596,37 @@ export async function loadSample() {
   toast('示例工程已载入（含切割事件、孤立层位、矛盾记录与已撤销判断）')
 }
 
+/** 清空时需要覆盖的全部数据表（含阶段推演与计算版本） */
+const ALL_TABLES = [
+  db.units,
+  db.positions,
+  db.relations,
+  db.evidences,
+  db.retractions,
+  db.batches,
+  db.phases,
+  db.phaseConstraints,
+  db.assignments,
+  db.versions,
+  db.diagnostics,
+]
+
 export async function clearAll(confirm = true) {
   if (confirm && !window.confirm('清空全部工程数据？此操作不可撤销。')) return
-  await db.transaction('rw', [db.units, db.positions, db.relations, db.evidences, db.retractions, db.batches], async () => {
-    await Promise.all([db.units.clear(), db.positions.clear(), db.relations.clear(), db.evidences.clear(), db.retractions.clear(), db.batches.clear()])
+  await db.transaction('rw', ALL_TABLES, async () => {
+    await Promise.all(ALL_TABLES.map((t) => t.clear()))
   })
   state.selectedUnitId = null
   await refresh()
   if (confirm) toast('工程已清空')
 }
 
-export function exportProject() {
-  const data: ProjectExport = {
+/** 组装导出数据（纯函数，便于测试与复用） */
+export function buildExport(): ProjectExport {
+  const latest = latestVersion.value
+  return {
     app: 'harris-matrix-workbench',
-    version: 1,
+    version: 2,
     exportedAt: new Date().toISOString(),
     units: state.units,
     positions: Object.values(state.positions),
@@ -334,14 +634,68 @@ export function exportProject() {
     evidences: state.evidences,
     retractions: state.retractions,
     partialOrder: reachablePairs(orderEdges.value),
+    phases: state.phases,
+    phaseConstraints: state.phaseConstraints,
+    assignments: Object.values(state.assignments),
+    phaseSnapshot: latest ? { results: latest.results, diagnostics: latest.diagnostics } : null,
   }
+}
+
+export function exportProject() {
+  const data = buildExport()
   const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
   const a = document.createElement('a')
   a.href = URL.createObjectURL(blob)
   a.download = `harris-matrix-${new Date().toISOString().slice(0, 10)}.json`
   a.click()
   URL.revokeObjectURL(a.href)
-  toast(`已导出（偏序闭包 ${data.partialOrder.length} 个可达对）`)
+  toast(`已导出（偏序闭包 ${data.partialOrder.length} 个可达对，阶段 ${data.phases.length} 个）`)
+}
+
+export interface ImportCheck {
+  /** 偏序闭包与导出快照是否一致 */
+  orderSame: boolean
+  /** 重算后的阶段区间与诊断是否与导出快照一致 */
+  phaseSame: boolean
+}
+
+/**
+ * 导入数据本体（不含确认交互，便于测试）。
+ * 导入后全量重算阶段推演，并与导出快照逐项比对区间与矛盾证据。
+ */
+export async function importData(data: ProjectExport): Promise<ImportCheck> {
+  await db.transaction('rw', ALL_TABLES, async () => {
+    await Promise.all(ALL_TABLES.map((t) => t.clear()))
+    await db.units.bulkPut(data.units)
+    await db.positions.bulkPut(data.positions ?? [])
+    await db.relations.bulkPut(data.relations)
+    await db.evidences.bulkPut(data.evidences ?? [])
+    await db.retractions.bulkPut(data.retractions ?? [])
+    await db.phases.bulkPut(data.phases ?? [])
+    await db.phaseConstraints.bulkPut(data.phaseConstraints ?? [])
+    await db.assignments.bulkPut(data.assignments ?? [])
+  })
+  await refresh()
+  state.layoutVersion++
+
+  // 偏序一致性校验：重算可达对并与导出快照比对
+  const expected = [...(data.partialOrder ?? [])].sort()
+  const actual = reachablePairs(orderEdges.value)
+  const orderSame = JSON.stringify(expected) === JSON.stringify(actual)
+
+  // 阶段推演校验：全量重算后与导出快照比对区间与诊断
+  let phaseSame = true
+  if ((data.phases ?? []).length > 0) {
+    await recomputePhases({ type: 'all' }, '导入工程')
+    const snap = data.phaseSnapshot
+    if (snap) {
+      const latest = state.versions[state.versions.length - 1]
+      phaseSame =
+        canonicalResults(latest.results) === canonicalResults(snap.results ?? []) &&
+        canonicalDiagnostics(latest.diagnostics) === canonicalDiagnostics(snap.diagnostics ?? [])
+    }
+  }
+  return { orderSame, phaseSame }
 }
 
 export async function importProject(file: File) {
@@ -357,19 +711,12 @@ export async function importProject(file: File) {
     return
   }
   if (!window.confirm('导入将替换当前工程（不可撤销），继续？')) return
-  await db.transaction('rw', [db.units, db.positions, db.relations, db.evidences, db.retractions, db.batches], async () => {
-    await Promise.all([db.units.clear(), db.positions.clear(), db.relations.clear(), db.evidences.clear(), db.retractions.clear(), db.batches.clear()])
-    await db.units.bulkPut(data.units)
-    await db.positions.bulkPut(data.positions ?? [])
-    await db.relations.bulkPut(data.relations)
-    await db.evidences.bulkPut(data.evidences ?? [])
-    await db.retractions.bulkPut(data.retractions ?? [])
-  })
-  await refresh()
-  state.layoutVersion++
-  // 偏序一致性校验：重算可达对并与导出快照比对
-  const expected = [...(data.partialOrder ?? [])].sort()
-  const actual = reachablePairs(orderEdges.value)
-  const same = JSON.stringify(expected) === JSON.stringify(actual)
-  toast(same ? `导入完成，偏序校验一致（${actual.length} 个可达对）` : '导入完成，但偏序与导出时不一致，请检查数据')
+  const check = await importData(data)
+  if (!check.orderSame) {
+    toast('导入完成，但偏序与导出时不一致，请检查数据')
+  } else if (!check.phaseSame) {
+    toast('导入完成，但阶段区间/诊断与导出时不一致，请检查数据')
+  } else {
+    toast('导入完成，偏序与阶段推演校验一致')
+  }
 }

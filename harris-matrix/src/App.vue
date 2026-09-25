@@ -4,6 +4,7 @@ import MatrixCanvas from './components/MatrixCanvas.vue'
 import UnitPanel from './components/UnitPanel.vue'
 import RelationPanel from './components/RelationPanel.vue'
 import BatchPanel from './components/BatchPanel.vue'
+import PhasePanel from './components/PhasePanel.vue'
 import {
   autoLayout,
   cancelCycle,
@@ -64,6 +65,7 @@ function onImportFile(e: Event) {
       <aside class="sidebar">
         <UnitPanel />
         <RelationPanel />
+        <PhasePanel />
         <BatchPanel />
       </aside>
       <MatrixCanvas />
