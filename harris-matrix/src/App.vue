@@ -3,12 +3,14 @@ import { computed, onMounted, ref } from 'vue'
 import MatrixCanvas from './components/MatrixCanvas.vue'
 import UnitPanel from './components/UnitPanel.vue'
 import RelationPanel from './components/RelationPanel.vue'
+import PhasePanel from './components/PhasePanel.vue'
 import BatchPanel from './components/BatchPanel.vue'
 import {
   autoLayout,
   cancelCycle,
   clearAll,
   confirmCycle,
+  ensurePhaseComputation,
   exportProject,
   importProject,
   lastBatch,
@@ -25,7 +27,7 @@ const fileInput = ref<HTMLInputElement>()
 const cyclePathText = computed(() => state.pendingCycle?.path.map(unitLabel).join(' → ') ?? '')
 
 onMounted(() => {
-  void refresh()
+  void refresh().then(() => ensurePhaseComputation())
 })
 
 function onImportFile(e: Event) {
@@ -64,6 +66,7 @@ function onImportFile(e: Event) {
       <aside class="sidebar">
         <UnitPanel />
         <RelationPanel />
+        <PhasePanel />
         <BatchPanel />
       </aside>
       <MatrixCanvas />

@@ -103,7 +103,8 @@ function rebuild() {
 
   cy.elements().remove()
   cy.add([...nodes, ...edges])
-  cy.layout({ name: 'preset', positions: (n: cytoscape.NodeSingular) => positionOf(n.id()), animate: false }).run()
+  // preset 布局的 positions 回调在运行时会收到节点对象（@types/cytoscape 声明有误），按 id 取位置
+  cy.layout({ name: 'preset', positions: (n: cytoscape.NodeSingular) => positionOf(n.id()), animate: false } as unknown as cytoscape.LayoutOptions).run()
   cy.fit(undefined, 40)
 }
 

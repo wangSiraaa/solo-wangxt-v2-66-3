@@ -1,15 +1,19 @@
-import type { Evidence, Relation, Retraction, StratUnit } from './types'
+import type { Evidence, Phase, PhaseAssignment, PhaseConstraint, Relation, Retraction, StratUnit } from './types'
 import { cyclePathIfAdded, type OrderEdge } from './graph'
 
 /**
  * 示例工程：一处含基槽切割、灰坑切割的堆积序列。
- * 故意包含：切割事件、孤立层位（1018）、互相矛盾的观察记录、一条已撤销的推断。
+ * 故意包含：切割事件、孤立层位（1018）、互相矛盾的观察记录、一条已撤销的推断，
+ * 以及一套三期的阶段方案（早期/中期/晚期）用于演示相对年代区间推演。
  */
 export function buildSample(now: number): {
   units: StratUnit[]
   evidences: Evidence[]
   relations: Relation[]
   retractions: Retraction[]
+  phases: Phase[]
+  phaseConstraints: PhaseConstraint[]
+  phaseAssignments: PhaseAssignment[]
 } {
   const units: StratUnit[] = [
     { id: '1001', label: '1001', type: 'deposit', note: '现代表土层', createdAt: now },
@@ -84,5 +88,21 @@ export function buildSample(now: number): {
     },
   ]
 
-  return { units, evidences, relations, retractions }
+  // 阶段方案：三期线序；仅三个层位有直接归属，其余由推演给出区间
+  const phases: Phase[] = [
+    { id: 'P1', label: '早期', note: '遗址最早活动阶段', createdAt: now },
+    { id: 'P2', label: '中期', note: '', createdAt: now + 1 },
+    { id: 'P3', label: '晚期', note: '废弃前最后阶段', createdAt: now + 2 },
+  ]
+  const phaseConstraints: PhaseConstraint[] = [
+    { id: 'PC1', before: 'P1', after: 'P2', createdAt: now },
+    { id: 'PC2', before: 'P2', after: 'P3', createdAt: now + 1 },
+  ]
+  const phaseAssignments: PhaseAssignment[] = [
+    { unitId: '1007', phaseId: 'P1', createdAt: now },
+    { unitId: '1009', phaseId: 'P2', createdAt: now },
+    { unitId: '1003', phaseId: 'P3', createdAt: now },
+  ]
+
+  return { units, evidences, relations, retractions, phases, phaseConstraints, phaseAssignments }
 }
